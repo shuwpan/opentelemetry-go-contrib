@@ -16,8 +16,11 @@ package otellambda // import "go.opentelemetry.io/contrib/instrumentation/github
 
 import (
 	"context"
+	"encoding/json"
+	"github.com/aws/aws-lambda-go/events"
 	"log"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/aws/aws-lambda-go/lambdacontext"
@@ -73,7 +76,6 @@ func (i *instrumentor) tracingBegin(ctx context.Context, eventJSON []byte) (cont
 	if lc != nil {
 		ctxRequestID := lc.AwsRequestID
 		attributes = append(attributes, semconv.FaaSExecution(ctxRequestID))
-
 		// Some resource attrs added as span attrs because lambda
 		// resource detectors are created before a lambda
 		// invocation and therefore lack lambdacontext.
@@ -85,13 +87,64 @@ func (i *instrumentor) tracingBegin(ctx context.Context, eventJSON []byte) (cont
 			if len(arnParts) >= 5 {
 				attributes = append(attributes, semconv.CloudAccountID(arnParts[4]))
 			}
+
 		}
 		attributes = append(attributes, i.resAttrs...)
+
+		triggerIdStr := getTriggerId(eventJSON)
+		if triggerIdStr != "" {
+			attributes = append(attributes, attribute.Key("faas.trigger_id").String(triggerIdStr))
+		}
 	}
 
 	ctx, span = i.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindServer), trace.WithAttributes(attributes...))
 
 	return ctx, span
+}
+
+func getTriggerId(eventJSON []byte) string {
+	result := ""
+
+	var elbEvent events.ALBTargetGroupRequest
+	err := json.Unmarshal(eventJSON, &elbEvent)
+	if err == nil && result == "" {
+		if hasField(elbEvent, "Headers") {
+			result = elbEvent.Headers["host"]
+		}
+	}
+
+	var sqsEvent events.SQSEvent
+	err = json.Unmarshal(eventJSON, &sqsEvent)
+	if err == nil && result == "" {
+		if hasField(sqsEvent, "Records") && len(sqsEvent.Records) > 0 {
+			result = sqsEvent.Records[0].EventSourceARN
+		}
+	}
+
+	var snsEvent events.SNSEvent
+	err = json.Unmarshal(eventJSON, &snsEvent)
+	if err == nil && result == "" {
+		if hasField(snsEvent, "Records") && len(sqsEvent.Records) > 0 {
+			result = snsEvent.Records[0].EventSubscriptionArn
+		}
+	}
+
+	var s3Event events.S3Event
+	err = json.Unmarshal(eventJSON, &s3Event)
+	if err == nil && result == "" {
+		if hasField(s3Event, "Records") && len(sqsEvent.Records) > 0 {
+			result = s3Event.Records[0].S3.Bucket.Arn
+		}
+	}
+
+	return result
+}
+
+func hasField(typeToCheck interface{}, fieldName string) bool {
+	value := reflect.ValueOf(typeToCheck)
+	field := value.FieldByName(fieldName)
+
+	return field.IsValid()
 }
 
 // Logic to wrap up OTel Tracing.
